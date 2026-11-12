@@ -4,8 +4,11 @@ require_once( 'config.php' );
 require_once( 'bd.php' );
 require_once( '../shared/funciones.php' );
 require_once( 'sesion.php' );
-$conn = conectar();
 
+$conn =   conectar();
+//$conn = conectar();
+//$db_dms = $_SESSION[ "Ses_db_dms" ];
+$db_dms = 'dms_farmaofertas';
 /* ==========================================================================
  * Toma física / ajuste de inventario  (versión sqlsrv)
  *  - Base de datos DMS, bodega y usuario salen de la sesión
@@ -15,6 +18,20 @@ $conn = conectar();
  * ========================================================================== */
 
 const INV_NIT_AJUSTE = '901157558';
+
+/* Lote que recibe el ajuste cuando el producto tiene varios lotes (se puede cambiar desde la pantalla):
+ *   'cercano' = el más próximo a vencer   'lejano' = el más lejano a vencer
+ * En las salidas, si el primer lote no alcanza, se sigue con el siguiente en el mismo orden. */
+const INV_ORDEN_ENTRADA = 'cercano';
+const INV_ORDEN_SALIDA = 'lejano';
+
+/* Si un lote participante tiene stock negativo se lleva a 0 con una entrada
+ * y esa cantidad se descuenta de los demás lotes (el total ajustado sigue siendo el mismo). */
+const INV_NORMALIZAR_NEGATIVOS = true;
+
+/* true = modo prueba: solo graba t_pedidos / t_pedidos_detalle (entradas Y salidas)
+ * sin volcar al DMS ni cerrar la toma. En producción debe ir en false. */
+const INV_SOLO_TEMPORALES = false;
 
 /* ------------------------------ helpers ---------------------------------- */
 
@@ -48,19 +65,26 @@ function inv_fila( array $row ): array {
  * devuelve el ÚLTIMO conjunto de resultados con columnas.
  */
 function inv_rows( $conn, string $sql, array $params = [] ): array {
+  $sets = inv_sets( $conn, $sql, $params );
+  return $sets ? end( $sets ) : [];
+}
+
+/** Igual que inv_rows pero devuelve TODOS los conjuntos de resultados (para lotes con varios select). */
+function inv_sets( $conn, string $sql, array $params = [] ): array {
   $st = sqlsrv_query( $conn, $sql, $params );
   if ( $st === false ) throw new Exception( inv_error_sql() );
-  $rows = [];
+  $sets = [];
   do {
     if ( sqlsrv_num_fields( $st ) > 0 ) {
       $rows = [];
       while ( $row = sqlsrv_fetch_array( $st, SQLSRV_FETCH_ASSOC ) ) $rows[] = inv_fila( $row );
+      $sets[] = $rows;
     }
     $next = sqlsrv_next_result( $st );
     if ( $next === false ) throw new Exception( inv_error_sql() );
   } while ( $next === true );
   sqlsrv_free_stmt( $st );
-  return $rows;
+  return $sets;
 }
 
 function inv_exec( $conn, string $sql, array $params = [] ): int {
@@ -107,28 +131,195 @@ function inv_fecha_sql( string $f ): ?string {
   return $d->format( 'Ymd' );
 }
 
+/**
+ * Condición SQL que deja por fuera las presentaciones fraccionadas (códigos terminados en MD, MC y MC*S):
+ * no entran al informe previo, al ajuste ni al avance.
+ */
+function inv_sql_no_fraccion( string $col ): string {
+  return "(rtrim($col) not like '%MD' and rtrim($col) not like '%MC' and rtrim($col) not like '%MC*S')";
+}
+
 /** Ejecuta SP_VOLCAR_DOCUMENTO y devuelve [numero_doc, tipo_doc, error]. */
 function inv_volcar( $conn, int $numero, int $sw, string $tipo ): array {
   $tipoDoc = '';
   $numeroDoc = 0;
   $error = '';
+  // Los parámetros OUTPUT con sqlsrv solo funcionan con la sintaxis ODBC {call ...}.
+  // Con "exec ... ? OUTPUT" el driver arma mal la sentencia: "Sintaxis incorrecta cerca de 'OUTPUT'".
+  // Tipos iguales a los del SP: @TIPO_DOC VARCHAR(4), @NUMERO_DOC INT, @ERROR_MESSAGE NVARCHAR(500)
   $params = [
     [ $numero, SQLSRV_PARAM_IN ],
     [ $sw, SQLSRV_PARAM_IN ],
     [ $tipo, SQLSRV_PARAM_IN ],
-    [ & $tipoDoc, SQLSRV_PARAM_INOUT, SQLSRV_PHPTYPE_STRING( SQLSRV_ENC_CHAR ), SQLSRV_SQLTYPE_VARCHAR( 20 ) ],
-    [ & $numeroDoc, SQLSRV_PARAM_INOUT, SQLSRV_PHPTYPE_INT, SQLSRV_SQLTYPE_INT ],
-    [ & $error, SQLSRV_PARAM_INOUT, SQLSRV_PHPTYPE_STRING( SQLSRV_ENC_CHAR ), SQLSRV_SQLTYPE_VARCHAR( 1000 ) ],
+    [ & $tipoDoc, SQLSRV_PARAM_OUT, SQLSRV_PHPTYPE_STRING( SQLSRV_ENC_CHAR ), SQLSRV_SQLTYPE_VARCHAR( 4 ) ],
+    [ & $numeroDoc, SQLSRV_PARAM_OUT, SQLSRV_PHPTYPE_INT, SQLSRV_SQLTYPE_INT ],
+    [ & $error, SQLSRV_PARAM_OUT, SQLSRV_PHPTYPE_STRING( 'UTF-8' ), SQLSRV_SQLTYPE_NVARCHAR( 500 ) ],
   ];
-  $st = sqlsrv_query( $conn, "exec SP_VOLCAR_DOCUMENTO
-                                @numero = ?, @sw = ?, @tipo = ?,
-                                @TIPO_DOC = ? OUTPUT, @NUMERO_DOC = ? OUTPUT, @ERROR_MESSAGE = ? OUTPUT", $params );
+  $st = sqlsrv_query( $conn, "{call SP_VOLCAR_DOCUMENTO(?, ?, ?, ?, ?, ?)}", $params );
   if ( $st === false ) return [ 0, '', inv_error_sql() ];
   // los parámetros OUTPUT solo se llenan después de consumir todos los resultados
   while ( ( $n = sqlsrv_next_result( $st ) ) === true ) {}
-  if ( $n === false ) return [ 0, '', inv_error_sql() ];
+  $errSql = $n === false ? inv_error_sql() : '';
   sqlsrv_free_stmt( $st );
-  return [ ( int )$numeroDoc, ( string )$tipoDoc, inv_utf8( trim( ( string )$error ) ) ];
+  $error = inv_utf8( trim( ( string )$error ) );
+  // si el SP hizo ROLLBACK, SQL Server además avisa "Transaction count after EXECUTE..."; se prefiere el mensaje del SP
+  if ( $error !== '' || $errSql !== '' ) return [ 0, '', $error !== '' ? $error : $errSql ];
+  return [ ( int )$numeroDoc, ( string )$tipoDoc, '' ];
+}
+
+/* ----------------------- ajuste repartido por lotes ---------------------- */
+
+function inv_orden( $valor, string $defecto ): string {
+  return in_array( $valor, [ 'cercano', 'lejano' ], true ) ? $valor : $defecto;
+}
+
+/** Ordena los lotes por vencimiento (sin fecha = al final); 'lejano' invierte el orden. Empate: id_lote. */
+function inv_ordenar_lotes( array $lotes, string $orden ): array {
+  usort( $lotes, function ( $a, $b ) {
+    $va = $a[ 'lote_vcmto' ] ?: '9999-12-31';
+    $vb = $b[ 'lote_vcmto' ] ?: '9999-12-31';
+    return [ $va, ( int )$a[ 'id_lote' ] ] <=> [ $vb, ( int )$b[ 'id_lote' ] ];
+  } );
+  return $orden === 'lejano' ? array_reverse( $lotes ) : $lotes;
+}
+
+/**
+ * Reparte la diferencia (contado - stock) entre los lotes del producto.
+ *  - Entrada: todo va al primer lote según $ordEntrada.
+ *  - Salida: se descuenta del primer lote con stock según $ordSalida; si no alcanza, sigue con el siguiente.
+ *    Así, lo no contado (contado 0) sale de todos los lotes con stock.
+ * Devuelve los lotes con la llave 'ajuste' (+ entra, - sale).
+ */
+function inv_repartir( array $lotes, float $contado, string $ordEntrada, string $ordSalida ): array {
+  $porId = [];
+  foreach ( $lotes as $l ) {
+    $l[ 'stock' ] = ( float )$l[ 'stock' ];
+    $l[ 'ajuste' ] = 0.0;
+    $porId[ ( int )$l[ 'id_lote' ] ] = $l;
+  }
+  if ( !$porId ) return [];
+
+  if ( INV_NORMALIZAR_NEGATIVOS ) {
+    foreach ( $porId as $id => $l ) {
+      if ( $l[ 'stock' ] < 0 ) $porId[ $id ][ 'ajuste' ] = -$l[ 'stock' ];
+    }
+  }
+  // stock de cada lote después de normalizar negativos
+  $disp = fn( $l ) => $l[ 'stock' ] + $l[ 'ajuste' ];
+  $total = array_sum( array_map( $disp, $porId ) );
+  $dif = round( $contado - $total, 4 );
+
+  if ( $dif > 0 ) {
+    // la entrada va a un lote que tenga stock (para no revivir lotes en 0);
+    // solo si ninguno tiene stock se usa cualquiera de los lotes de la toma
+    $conStock = array_filter( $porId, fn( $l ) => $l[ 'stock' ] > 0 );
+    $destino = inv_ordenar_lotes( array_values( $conStock ?: $porId ), $ordEntrada )[ 0 ];
+    $porId[ ( int )$destino[ 'id_lote' ] ][ 'ajuste' ] += $dif;
+  } elseif ( $dif < 0 ) {
+    $resto = -$dif;
+    foreach ( inv_ordenar_lotes( array_values( $porId ), $ordSalida ) as $l ) {
+      $id = ( int )$l[ 'id_lote' ];
+      $hay = $disp( $porId[ $id ] );
+      if ( $hay <= 0 ) continue;
+      $q = min( $hay, $resto );
+      $porId[ $id ][ 'ajuste' ] -= $q;
+      $resto = round( $resto - $q, 4 );
+      if ( $resto <= 0 ) break;
+    }
+  }
+  foreach ( $porId as $id => $l ) $porId[ $id ][ 'ajuste' ] = round( $l[ 'ajuste' ], 4 );
+  return array_values( inv_ordenar_lotes( array_values( $porId ), 'cercano' ) );
+}
+
+/**
+ * Calcula el ajuste de toda la toma física de la bodega.
+ *  - Productos: referencias_fis (fisico = 1); el conteo es por total (toma_3 > toma_2 > toma_1).
+ *  - Lotes que participan: referencias_fis_lote (codigo, bodega, id_lote).
+ *  - Stock de cada lote: v_lotes_stock (solo por bodega, codigo e id_lote).
+ *  - No entran los códigos terminados en MD, MC y MC*S.
+ */
+function inv_calcular_ajuste( $conn, string $db, int $bodega, string $ordEntrada, string $ordSalida ): array {
+  $noFraccion = inv_sql_no_fraccion( 'f.codigo' );
+  $productos = inv_rows( $conn, "select
+        f.codigo,
+        r.descripcion,
+        f.bodega,
+        r.porcentaje_iva,
+        isnull(f.toma_1,0) as toma_1,
+        isnull(f.toma_2,0) as toma_2,
+        isnull(f.toma_3,0) as toma_3,
+        case
+          when f.toma_3 > 0 then f.toma_3
+          when f.toma_2 > 0 then f.toma_2
+          when f.toma_1 > 0 then f.toma_1
+          else 0
+        end as contado,
+        cast(round((
+          case when isnull(p.promedio,0) = 0 then isnull((
+                 select top 1 ll.costo_unitario
+                 from $db.dbo.documentos_lin ll
+                 where ll.codigo = f.codigo and ll.sw in (11,1,4,16) and ll.tipo <> 'DISP'
+                 order by ll.fec desc
+               ), r.costo_unitario)
+          else p.promedio end
+        ),0) as decimal(19,2)) as costo,
+        isnull(cb.alterno,'') as cod_barras,
+        round(isnull(lp.precio_venta,0),0) as precio
+      from $db.dbo.referencias_fis f
+      inner join $db.dbo.referencias r on r.codigo = f.codigo
+      outer apply (select top 1 v.promedio from $db.dbo.v_promedio v
+                   where v.codigo = f.codigo and v.mes = month(getdate()) and v.ano = year(getdate())) p
+      outer apply (select top 1 a.alterno from $db.dbo.referencias_alt a where a.codigo = f.codigo) cb
+      outer apply (select top 1 l.precio_venta from $db.dbo.v_lista_precios_iva l
+                   where l.codigo = f.codigo and l.bodega = f.bodega and l.lista = 1) lp
+      where f.bodega = ? and isnull(f.fisico,0) = 1 and $noFraccion
+      order by r.descripcion", [ $bodega ] );
+
+  $lotes = inv_rows( $conn, "select
+        fl.codigo,
+        fl.id_lote,
+        ml.lote,
+        ml.lote_vcmto,
+        isnull(s.stock,0) as stock
+      from (select distinct codigo, bodega, id_lote from $db.dbo.referencias_fis_lote where bodega = ?) fl
+      inner join $db.dbo.referencias_fis f on f.codigo = fl.codigo and f.bodega = fl.bodega and isnull(f.fisico,0) = 1
+      left join $db.dbo.maestro_lotes ml on ml.id_lote = fl.id_lote and ml.codigo = fl.codigo
+      outer apply (select sum(vs.stock) as stock from $db.dbo.v_lotes_stock vs
+                   where vs.codigo = fl.codigo and vs.bodega = fl.bodega and vs.id_lote = fl.id_lote) s
+      where $noFraccion", [ $bodega ] );
+
+  $lotesPorCodigo = [];
+  foreach ( $lotes as $l ) $lotesPorCodigo[ trim( $l[ 'codigo' ] ) ][] = $l;
+
+  $filas = [];
+  foreach ( $productos as $p ) {
+    $conteo = ( float )$p[ 'contado' ];
+    $lp = $lotesPorCodigo[ trim( $p[ 'codigo' ] ) ] ?? [];
+    $stock = round( array_sum( array_map( fn( $l ) => ( float )$l[ 'stock' ], $lp ) ), 4 );
+    $detalle = inv_repartir( $lp, $conteo, $ordEntrada, $ordSalida );
+
+    $entra = $sale = 0.0;
+    foreach ( $detalle as $d ) {
+      if ( $d[ 'ajuste' ] > 0 ) $entra += $d[ 'ajuste' ];
+      else $sale -= $d[ 'ajuste' ];
+    }
+
+    $proceso = $conteo > $stock ? 'entrada' : ( $conteo < $stock ? 'salida' : '--' );
+    if ( count( $lp ) === 0 && $conteo > 0 ) $proceso = 'sin lote'; // contado pero sin lote en referencias_fis_lote
+
+    unset( $p[ 'contado' ] );
+    $filas[] = $p + [
+      'conteo' => $conteo,
+      'stock' => $stock,
+      'proceso' => $proceso,
+      'tipo' => $proceso,
+      'cant_ajuste' => abs( $conteo - $stock ),
+      'entra' => round( $entra, 4 ),
+      'sale' => round( $sale, 4 ),
+      'lotes' => $detalle,
+    ];
+  }
+  return $filas;
 }
 
 /* --------------------------- validar sesión ------------------------------ */
@@ -137,7 +328,7 @@ if ( !validarSessionEmpresa() ) inv_json( [ 'ok' => false, 'message' => 'No se e
 if ( !validarSessionBodega() ) inv_json( [ 'ok' => false, 'message' => 'No se encontro la bodega de trabajo', 'mensaje' => 'No se encontro la bodega de trabajo' ] );
 if ( !validarSessionDb() ) inv_json( [ 'ok' => false, 'message' => 'No se encontro la base de datos', 'mensaje' => 'No se encontro la base de datos' ] );
 
-$db_dms = $_SESSION[ "Ses_db_dms" ];
+
 if ( !preg_match( '/^\w+$/', $db_dms ) ) inv_json( [ 'ok' => false, 'message' => 'Base de datos inválida' ] );
 $bodega_trabajo = ( int )$_SESSION[ "Ses_bodega_default" ];
 $usuario = mb_substr( ( string )$_SESSION[ "Ses_usuario" ], 0, 10 );
@@ -164,12 +355,12 @@ try {
       }
       if ( count( $alterno ) === 1 ) $term = $alterno[ 0 ][ "codigo" ];
 
-      $params = [ $bodega, $bodega ];
+      $params = [ $bodega, $bodega, $bodega, $bodega ];
       if ( $buscar_por == 'codigo' ) {
         $criterio = "r.codigo = ?";
         $params[] = $term;
       } else {
-        $criterio = "(r.descripcion like ? or r.codigo = ?)";
+        $criterio = "(r.descripcion like ? or r.codigo = ? )";
         $params[] = '%' . str_replace( [ '[', '%', '_' ], [ '[[]', '[%]', '[_]' ], $term ) . '%';
         $params[] = $term;
       }
@@ -180,8 +371,23 @@ try {
                 r.und_1, r.und_2, r.und_3,
                 r.can_1, r.can_2, r.can_3,
                 isnull(t.stock, 0) as stock,
-                isnull(f.$col, 0) as conteo
+                isnull(f.$col, 0) as conteo,
+                laboratorio = isnull(l.nombres,''),
+                alerta = isnull((SELECT
+                                  COUNT(*)
+                                  FROM $db_dms.dbo.referencias r1
+                                  INNER JOIN $db_dms.dbo.v_ref_total s on s.codigo = r1.codigo
+                                  AND s.mes = month(getdate()) and s.ano = year(getdate())
+                                  AND s.bodega = ?
+                                  WHERE s.Stock > 0
+                                  AND r1.codigo LIKE '%*[A-Z]'
+                                  AND R1.codigo like r.codigo
+                                 --  AND r1.codigo<>r.codigo
+                ),0),
+                n_lotes = (select count(distinct fl.id_lote) from $db_dms.dbo.referencias_fis_lote fl
+                           where fl.codigo = r.codigo and fl.bodega = ?)
               from $db_dms.dbo.referencias r
+              left join $db_dms.dbo.terceros l on l.nit = r.nit
               left join $db_dms.dbo.v_ref_total t on t.codigo = r.codigo
                     and t.mes = month(getdate())
                     and t.ano = year(getdate())
@@ -189,7 +395,18 @@ try {
               inner join $db_dms.dbo.referencias_fis f on f.codigo = r.codigo
                     and isnull(f.fisico, 0) = 1
                     and f.bodega = ?
-              where $criterio";
+              where $criterio AND r.codigo  not in(
+                  SELECT distinct
+                  r.CODIGO
+                  FROM $db_dms.dbo.referencias r
+                  left join $db_dms.dbo.v_ref_total t on t.codigo = r.codigo
+                  and t.mes = month(getdate())
+                  and t.ano=year(getdate())
+                  where (r.codigo  like '%MD' or r.codigo  like '%MC' or r.CODIGO  LIKE '%MC*S')
+                  and t.stock=0
+
+              )";
+
       $resultado = inv_rows( $conn, $sql, $params );
       if ( count( $resultado ) == 0 ) {
         inv_json( [ 'ok' => false, 'data' => [], 'message' => 'El producto no existe o no esta en toma fisica' ] );
@@ -257,6 +474,50 @@ try {
       }
       inv_json( [ 'ok' => false, 'message' => 'Error al insertar nuevo lote' ] );
 
+    /* Crea un lote en maestro_lotes para productos de la toma que no tienen lotes y lo asocia
+       a la toma (referencias_fis_lote) para que el ajuste pueda hacerse sobre ese lote. */
+    case "crear-lotes":
+      $bodega = inv_bodega();
+      $codigos = json_decode( ( string )( $_POST[ "codigos" ] ?? '[]' ), true );
+      $lote = strtoupper( trim( ( string )( $_POST[ "lote" ] ?? '' ) ) );
+      $vcmto = inv_fecha_sql( ( string )( $_POST[ "lote_vcmto" ] ?? '' ) ); // yyyy-mm-dd o dd-mm-yyyy
+      if ( !is_array( $codigos ) || count( $codigos ) === 0 ) inv_json( [ 'ok' => false, 'message' => 'No hay productos para crear lote' ] );
+      if ( count( $codigos ) > 1000 ) inv_json( [ 'ok' => false, 'message' => 'Máximo 1000 productos por vez' ] );
+      if ( $lote === '' ) inv_json( [ 'ok' => false, 'message' => 'Digite el nombre del lote' ] );
+      if ( mb_strlen( $lote ) > 30 ) inv_json( [ 'ok' => false, 'message' => 'El lote no puede tener más de 30 caracteres' ] );
+      $codigos = array_values( array_unique( array_filter( array_map( fn( $c ) => trim( ( string )$c ), $codigos ), fn( $c ) => $c !== '' ) ) );
+      $notasLote = mb_substr( "Creado en toma fisica web bodega $bodega por $usuario", 0, 250 );
+
+      $creados = [];
+      $omitidos = [];
+      if ( !sqlsrv_begin_transaction( $conn ) ) throw new Exception( inv_error_sql() );
+      try {
+        foreach ( $codigos as $cod ) {
+          $marcado = inv_rows( $conn, "select codigo from $db_dms.dbo.referencias_fis where codigo = ? and bodega = ? and isnull(fisico,0) = 1",
+            [ $cod, $bodega ] );
+          if ( count( $marcado ) === 0 ) { $omitidos[] = [ 'codigo' => $cod, 'motivo' => 'No está marcado para toma física' ]; continue; }
+
+          $tiene = inv_rows( $conn, "select top 1 id_lote from $db_dms.dbo.referencias_fis_lote where codigo = ? and bodega = ?", [ $cod, $bodega ] );
+          if ( count( $tiene ) > 0 ) { $omitidos[] = [ 'codigo' => $cod, 'motivo' => 'Ya tiene lotes en la toma' ]; continue; }
+
+          // codigo + lote es único en maestro_lotes: si ya existe se reutiliza
+          $m = inv_rows( $conn, "select id_lote from $db_dms.dbo.maestro_lotes where codigo = ? and lote = ?", [ $cod, $lote ] );
+          $idLote = count( $m ) > 0 ? ( int )$m[ 0 ][ 'id_lote' ]
+            : inv_insert( $conn, "$db_dms.dbo.maestro_lotes", [ 'codigo' => $cod, 'lote' => $lote, 'lote_vcmto' => $vcmto, 'notas' => $notasLote ] );
+          if ( $idLote <= 0 ) throw new Exception( "No se pudo crear el lote de $cod" );
+
+          inv_exec( $conn, "insert into $db_dms.dbo.referencias_fis_lote (codigo, bodega, id_lote) values (?, ?, ?)",
+            [ $cod, $bodega, $idLote ] );
+          $creados[] = [ 'codigo' => $cod, 'id_lote' => $idLote ];
+        }
+        if ( !sqlsrv_commit( $conn ) ) throw new Exception( inv_error_sql() );
+      } catch ( Throwable $e ) {
+        inv_rollback( $conn );
+        throw $e;
+      }
+      inv_json( [ 'ok' => true, 'message' => count( $creados ) . ' lote(s) creado(s)', 'lote' => $lote,
+        'creados' => $creados, 'omitidos' => $omitidos ] );
+
     case "Insertar_conteo":
       $codigo = trim( ( string )( $_POST[ "codigo" ] ?? '' ) );
       $bodega = inv_bodega();
@@ -316,92 +577,51 @@ try {
 
     case "generar-info-es":
       $bodega = inv_bodega();
-      $where = '';
       $mostrar = $_POST[ "mostrar_resultados" ] ?? '';
-      if ( $mostrar == "diferencias" ) $where = "where isnull(d.contado,0) <> isnull(d.stock,0)";
-      elseif ( $mostrar == "con-conteos" ) $where = "where isnull(d.contado,0) <> 0";
+      $filas = inv_calcular_ajuste( $conn, $db_dms, $bodega,
+        inv_orden( $_POST[ "orden_entrada" ] ?? '', INV_ORDEN_ENTRADA ),
+        inv_orden( $_POST[ "orden_salida" ] ?? '', INV_ORDEN_SALIDA ) );
 
-      $sql = "set nocount on;
-              -- diferencias de entradas y salidas
-              select
-                r.codigo,
-                r.descripcion,
-                isnull(l.toma_1,0) as toma_1,
-                isnull(l.toma_2,0) as toma_2,
-                isnull(l.toma_3,0) as toma_3,
-                isnull(case
-                         when l.toma_3 > 0 then l.toma_3
-                         when l.toma_2 > 0 then l.toma_2
-                         when l.toma_1 > 0 then l.toma_1
-                       end, 0) as contado,
-                isnull(v.stock,0) as stock,
-                l.bodega,
-                r.porcentaje_iva
-              into #datos
-              from $db_dms.dbo.referencias_fis l
-              left join $db_dms.dbo.v_ref_total v on v.codigo = l.codigo
-                                                 and v.bodega = l.bodega
-                                                 and v.mes = month(getdate())
-                                                 and v.ano = year(getdate())
-              inner join $db_dms.dbo.referencias r on r.codigo = l.codigo
-              where l.bodega = ? and isnull(l.fisico,0) = 1;
-
-              select
-                d.codigo,
-                d.descripcion,
-                cast(isnull(d.contado,0) as numeric(19,0)) as conteo,
-                cast(isnull(d.stock,0) as numeric(19,0)) as stock,
-                d.porcentaje_iva,
-                d.bodega,
-                case when isnull(d.contado,0) <> isnull(d.stock,0) then
-                       case when isnull(d.contado,0) > isnull(d.stock,0) then 'entrada' else 'salida' end
-                     else '--'
-                end as proceso,
-                cast(round((
-                  case when isnull(p.promedio,0) = 0 then isnull((
-                         select top 1 ll.costo_unitario
-                         from $db_dms.dbo.documentos_lin ll
-                         where ll.codigo = d.codigo and ll.sw in (11,1,4,16) and ll.tipo <> 'DISP'
-                         order by ll.fec desc
-                       ), r.costo_unitario)
-                  else p.promedio end
-                ),0) as decimal(19,2)) as costo,
-                case when isnull(d.contado,0) <> isnull(d.stock,0) then
-                       case when isnull(d.contado,0) > isnull(d.stock,0) then 'entrada' else 'salida' end
-                     else '--'
-                end as tipo,
-                d.toma_1,
-                d.toma_2,
-                d.toma_3
-              into #result
-              from #datos d
-              inner join $db_dms.dbo.referencias r on r.codigo = d.codigo
-              left join $db_dms.dbo.v_ref_total v on v.codigo = d.codigo
-                                                 and v.bodega = d.bodega
-                                                 and v.ano = year(getdate())
-                                                 and v.mes = month(getdate())
-              left join $db_dms.dbo.v_promedio p on p.codigo = v.codigo
-                                                and p.mes = month(getdate())
-                                                and p.ano = year(getdate())
-              $where;
-
-              select
-                r.*,
-                cod_barras = isnull((select top 1 alterno from $db_dms.dbo.referencias_alt where codigo = r.codigo), ''),
-                round(isnull(ll.precio_venta,0),0) as precio
-              from #result r
-              left join $db_dms.dbo.v_lista_precios_iva ll on ll.codigo = r.codigo
-                                                          and ll.bodega = ?
-                                                          and ll.lista = 1
-              order by r.descripcion;";
-      inv_json( inv_rows( $conn, $sql, [ $bodega, $bodega ] ) );
+      if ( $mostrar == "diferencias" ) {
+        $filas = array_filter( $filas, fn( $f ) => $f[ 'entra' ] > 0 || $f[ 'sale' ] > 0 || $f[ 'proceso' ] === 'sin lote' );
+      } elseif ( $mostrar == "con-conteos" ) {
+        $filas = array_filter( $filas, fn( $f ) => $f[ 'conteo' ] != 0 );
+      }
+      inv_json( array_values( $filas ) );
 
     case "hacer-ajuste":
       $bodega = inv_bodega();
       $tipo_doc_entrada = trim( ( string )( $_POST[ "tipo_doc_entrada" ] ?? '' ) );
       $tipo_doc_salida = trim( ( string )( $_POST[ "tipo_doc_salida" ] ?? '' ) );
-      $entradas = isset( $_POST[ 'entradas' ] ) ? ( json_decode( $_POST[ 'entradas' ], true ) ?: [] ) : [];
-      $salidas = isset( $_POST[ 'salidas' ] ) ? ( json_decode( $_POST[ 'salidas' ], true ) ?: [] ) : [];
+
+      // El ajuste se recalcula aquí con los conteos actuales (no se confía en lo que manda el navegador)
+      $filas = inv_calcular_ajuste( $conn, $db_dms, $bodega,
+        inv_orden( $_POST[ "orden_entrada" ] ?? '', INV_ORDEN_ENTRADA ),
+        inv_orden( $_POST[ "orden_salida" ] ?? '', INV_ORDEN_SALIDA ) );
+
+      $sinLote = array_column( array_filter( $filas, fn( $f ) => $f[ 'proceso' ] === 'sin lote' ), 'codigo' );
+      if ( $sinLote ) {
+        inv_json( [ 'ok' => false, 'sin_lote' => array_map( 'trim', $sinLote ),
+          'message' => 'Estos productos tienen conteo pero no tienen lotes en la toma, créeles un lote primero: '
+          . implode( ', ', array_map( 'trim', $sinLote ) ) ] );
+      }
+
+      // una línea por lote: entradas (sw 12) y salidas (sw 11)
+      $entradas = $salidas = [];
+      foreach ( $filas as $f ) {
+        foreach ( $f[ 'lotes' ] as $l ) {
+          if ( $l[ 'ajuste' ] == 0 ) continue;
+          $linea = [
+            'codigo' => $f[ 'codigo' ],
+            'cantidad' => abs( $l[ 'ajuste' ] ),
+            'id_lote' => ( int )$l[ 'id_lote' ],
+            'costo' => ( float )$f[ 'costo' ],
+            'porcentaje_iva' => ( float )$f[ 'porcentaje_iva' ],
+          ];
+          if ( $l[ 'ajuste' ] > 0 ) $entradas[] = $linea;
+          else $salidas[] = $linea;
+        }
+      }
 
       if ( count( $entradas ) === 0 && count( $salidas ) === 0 ) {
         inv_json( [ 'ok' => false, 'message' => 'No hay diferencias para ajustar' ] );
@@ -456,6 +676,7 @@ try {
               'sw' => $doc[ 'sw' ],
               'bodega' => $bodega,
               'codigo' => ( string )$l[ 'codigo' ],
+              'id_lote' => ( int )$l[ 'id_lote' ],
               'valor_unitario' => ( float )$l[ 'costo' ],
               'porcentaje_iva' => ( float )( $l[ 'porcentaje_iva' ] ?? 0 ),
               'porcentaje_descuento' => 0,
@@ -473,6 +694,8 @@ try {
             if ( $idDet <= 0 ) throw new Exception( 'No se pudo guardar el detalle de ' . $l[ 'codigo' ] );
           }
 
+          if ( INV_SOLO_TEMPORALES ) continue; // modo prueba: sigue con el siguiente documento sin volcar
+
           // volcar al DMS
           [ $numeroDoc, , $error ] = inv_volcar( $conn, $doc[ 'numero' ], $doc[ 'sw' ], $doc[ 'tipo' ] );
           if ( $numeroDoc == 0 || $error !== '' ) throw new Exception( $error ?: 'No se pudo guardar el documento' );
@@ -480,10 +703,17 @@ try {
         }
         unset( $doc );
 
+        if ( INV_SOLO_TEMPORALES ) {
+          if ( !sqlsrv_commit( $conn ) ) throw new Exception( inv_error_sql() );
+          inv_json( [ 'ok' => true,
+            'entrada' => 'temporal ' . $docs[ 0 ][ 'numero' ],
+            'salida' => 'temporal ' . $docs[ 1 ][ 'numero' ] ] );
+        }
+/*
         // cerrar la toma física de la bodega
         inv_exec( $conn, "update $db_dms.dbo.referencias_fis
                           set toma_1 = 0, toma_2 = 0, toma_3 = 0, fisico = 0
-                          where bodega = ?", [ $bodega ] );
+                          where bodega = ?", [ $bodega ] );*/
 
         if ( !sqlsrv_commit( $conn ) ) throw new Exception( inv_error_sql() );
       } catch ( Throwable $e ) {
@@ -499,6 +729,67 @@ try {
       }
 
       inv_json( [ 'ok' => true, 'entrada' => $docs[ 0 ][ 'numero_doc' ], 'salida' => $docs[ 1 ][ 'numero_doc' ] ] );
+
+    case "avance-inventario":
+      // Avance de la toma física (referencias_fis) y lo contado por cada usuario.
+      // Nota: referencias_fis guarda solo el ÚLTIMO usuario que grabó cada toma (usu_toma_X).
+      $bodega = inv_bodega();
+      $col = inv_col_toma( $_POST[ "conteo" ] ?? 1 );
+      $noFraccion = inv_sql_no_fraccion( 'f.codigo' );
+      [ $resumen, $usuarios, $pendientes ] = inv_sets( $conn, "set nocount on;
+          if object_id('tempdb..#av') is not null drop table #av;
+
+          select
+            f.codigo,
+            r.descripcion,
+            isnull(f.toma_1,0) as toma_1,
+            isnull(f.toma_2,0) as toma_2,
+            isnull(f.toma_3,0) as toma_3,
+            f.usu_toma_1, f.usu_toma_2, f.usu_toma_3,
+            f.fecha_ultima,
+            isnull(s.stock,0) as stock
+          into #av
+          from $db_dms.dbo.referencias_fis f
+          inner join $db_dms.dbo.referencias r on r.codigo = f.codigo
+          outer apply (select sum(vs.stock) as stock
+                       from $db_dms.dbo.v_lotes_stock vs
+                       where vs.codigo = f.codigo and vs.bodega = f.bodega
+                         and vs.id_lote in (select fl.id_lote from $db_dms.dbo.referencias_fis_lote fl
+                                            where fl.codigo = f.codigo and fl.bodega = f.bodega)) s
+          where f.bodega = ? and isnull(f.fisico,0) = 1 and $noFraccion;
+
+          select
+            count(*) as referencias,
+            isnull(sum(case when stock > 0 then 1 else 0 end),0) as con_stock,
+            isnull(sum(case when toma_1 > 0 then 1 else 0 end),0) as contadas_1,
+            isnull(sum(case when toma_2 > 0 then 1 else 0 end),0) as contadas_2,
+            isnull(sum(case when toma_3 > 0 then 1 else 0 end),0) as contadas_3,
+            isnull(sum(case when toma_1 > 0 or toma_2 > 0 or toma_3 > 0 then 1 else 0 end),0) as contadas,
+            isnull(sum(case when stock > 0 and (toma_1 > 0 or toma_2 > 0 or toma_3 > 0) then 1 else 0 end),0) as con_stock_contadas,
+            isnull(sum(case when stock > 0 then stock else 0 end),0) as unidades_stock,
+            isnull(sum(case when toma_3 > 0 then toma_3 when toma_2 > 0 then toma_2 else toma_1 end),0) as unidades_contadas
+          from #av;
+
+          select
+            x.toma,
+            x.usuario,
+            count(*) as referencias,
+            sum(x.cantidad) as unidades,
+            max(x.fecha_ultima) as ultima
+          from (
+            select 1 as toma, isnull(nullif(ltrim(rtrim(usu_toma_1)),''),'(sin usuario)') as usuario, toma_1 as cantidad, fecha_ultima from #av where toma_1 > 0
+            union all
+            select 2, isnull(nullif(ltrim(rtrim(usu_toma_2)),''),'(sin usuario)'), toma_2, fecha_ultima from #av where toma_2 > 0
+            union all
+            select 3, isnull(nullif(ltrim(rtrim(usu_toma_3)),''),'(sin usuario)'), toma_3, fecha_ultima from #av where toma_3 > 0
+          ) x
+          group by x.toma, x.usuario
+          order by x.toma, count(*) desc;
+
+          select codigo, descripcion, stock from #av where $col = 0 order by stock desc, descripcion;
+
+          drop table #av;", [ $bodega ] );
+      inv_json( [ 'ok' => true, 'resumen' => $resumen[ 0 ] ?? [], 'usuarios' => $usuarios, 'pendientes' => $pendientes ] );
 
     case "list-lab":
       inv_json( inv_rows( $conn, "select distinct t.nit, t.nombres
