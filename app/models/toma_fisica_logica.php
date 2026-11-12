@@ -16,6 +16,18 @@
 
 const TF_DECIMALES = 4;
 
+/** Sufijos de código que NO entran al seguimiento ni al ajuste (presentaciones fraccionadas). */
+const TF_SUFIJOS_EXCLUIDOS = [ 'MC*S', 'MD', 'MC' ];
+
+/** true si el código termina en alguno de los sufijos excluidos (MD, MC, MC*S). */
+function tf_excluido( string $codigo ): bool {
+  $c = strtoupper( rtrim( $codigo ) );
+  foreach ( TF_SUFIJOS_EXCLUIDOS as $suf ) {
+    if ( strlen( $c ) > strlen( $suf ) && substr( $c, -strlen( $suf ) ) === $suf ) return true;
+  }
+  return false;
+}
+
 /** Ordena lotes por fecha de vencimiento ascendente (sin fecha al final) y luego por id_lote. */
 function tf_orden_fefo( array $lotes ): array {
   usort( $lotes, function ( $a, $b ) {

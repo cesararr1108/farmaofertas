@@ -61,5 +61,13 @@ $difs = array_column( $r, 'diferencia', 'lote' );
 if ( $difs != [ 'AA' => -2, 'BB' => -2, 'CC' => 0 ] ) { $fallos++; echo "FALLO diferencias: " . json_encode( $difs ) . "\n"; }
 else echo "OK    Diferencias de salida correctas\n";
 
+// Exclusión por sufijo de código
+$casos = [ 'ABC123MD' => true, 'ABC123MC' => true, 'ABC123MC*S' => true, 'abc123mc ' => true,
+  'ABC123' => false, 'MD' => false, 'ABCMCS' => false, 'ABC123MDX' => false ];
+foreach ( $casos as $cod => $esp ) {
+  if ( tf_excluido( $cod ) !== $esp ) { $fallos++; echo "FALLO tf_excluido('$cod') esperaba " . var_export( $esp, true ) . "\n"; }
+}
+echo "OK    Exclusión de códigos MD / MC / MC*S\n";
+
 echo $fallos === 0 ? "\nTodas las pruebas pasaron\n" : "\n$fallos prueba(s) fallaron\n";
 exit( $fallos === 0 ? 0 : 1 );

@@ -81,9 +81,12 @@
         <div class="tab-pane fade show active" id="tab-conteo" role="tabpanel">
           <div class="row">
             <div class="col-md-9">
-              <div class="input-group input-group-sm"> <span class="input-group-text text-primary"><i class="ri-search-2-line"></i></span>
-                <input type="text" class="form-control text-primary" id="busqueda" placeholder="Código / Código de barras / Descripción" autocomplete="off" autofocus />
-              </div>
+              <!-- form: Enter o el botón ✓/Ir del teclado del celular buscan/seleccionan -->
+              <form id="form-busqueda" autocomplete="off">
+                <div class="input-group input-group-sm"> <span class="input-group-text text-primary"><i class="ri-search-2-line"></i></span>
+                  <input type="search" class="form-control text-primary" id="busqueda" placeholder="Código / Código de barras / Descripción" autocomplete="off" enterkeyhint="search" autofocus />
+                </div>
+              </form>
             </div>
             <div class="col-md-3 pt-1">
               <div class="form-check form-switch">
@@ -100,7 +103,9 @@
                   <div class="col-md-5">
                     <div class="text-muted small" id="p_codigo"></div>
                     <div class="fw-bold" id="p_descripcion"></div>
-                    <div class="small">Lotes: <span id="p_lotes"></span></div>
+                    <div class="small">Lotes: <span id="p_lotes"></span>
+                      <button type="button" class="btn btn-sm btn-outline-success py-0 ms-1" id="btn-crear-lote-producto" style="display:none"><i class="fa-solid fa-plus"></i> Crear lote</button>
+                    </div>
                   </div>
                   <div class="col-4 col-md-2 text-center">
                     <div class="small text-muted">Sistema</div>
@@ -112,7 +117,9 @@
                   </div>
                   <div class="col-4 col-md-3">
                     <label class="small" id="lbl_cantidad" for="cantidad">Cantidad a sumar</label>
-                    <input type="number" step="any" class="form-control" id="cantidad" />
+                    <form id="form-cantidad" autocomplete="off">
+                      <input type="number" step="any" inputmode="decimal" enterkeyhint="done" class="form-control" id="cantidad" />
+                    </form>
                   </div>
                 </div>
                 <div class="mt-2 text-end">
@@ -202,6 +209,39 @@
         </div>
 
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- Modal crear lote -->
+<div class="modal fade" id="modalCrearLote" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form id="form-crear-lote" autocomplete="off">
+        <div class="modal-header">
+          <h5 class="modal-title">Crear lote</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <p class="small text-muted mb-2">Se crea el lote en <b>maestro_lotes</b> y se asocia a la toma de la bodega, para que el ajuste entre por ese lote.</p>
+          <div class="row">
+            <div class="col-7">
+              <label class="small" for="cl_lote">Lote</label>
+              <input type="text" class="form-control form-control-sm text-uppercase" id="cl_lote" maxlength="30" required />
+            </div>
+            <div class="col-5">
+              <label class="small" for="cl_vcmto">Vencimiento</label>
+              <input type="date" class="form-control form-control-sm" id="cl_vcmto" />
+            </div>
+          </div>
+          <div class="mt-2 small"><b id="cl_cantidad"></b> referencia(s):</div>
+          <div class="small border rounded p-1 tabla-scroll" style="max-height:35vh" id="cl_lista"></div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Cancelar</button>
+          <button type="submit" class="btn btn-success btn-sm" id="cl_guardar"><i class="fa-solid fa-check"></i> Crear lote</button>
+        </div>
+      </form>
     </div>
   </div>
 </div>

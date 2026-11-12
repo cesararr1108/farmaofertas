@@ -160,6 +160,7 @@ function tf_plan( $conn, string $db, int $bodega, int $toma, bool $incluirNoCont
 
   foreach ( $prods as $p ) {
     $cod = $p[ 'codigo' ];
+    if ( tf_excluido( $cod ) ) continue; // MD, MC, MC*S no se ajustan
     $contado = $p[ 'contado' ] === null ? 0.0 : ( float )$p[ 'contado' ];
     $item = [
       'codigo' => $cod,
@@ -250,6 +251,15 @@ function tf_crear_documento( $conn, string $db, int $sw, string $tipo, int $bode
         $l[ 'lote' ], $l[ 'vcmto' ], $l[ 'id_lote' ] ] );
   }
   return $numero;
+}
+
+/** Fecha yyyy-mm-dd o dd-mm-yyyy a 'Ymd' (formato que SQL Server lee igual en cualquier idioma). */
+function tf_fecha_sql( string $f ): ?string {
+  $f = trim( $f );
+  if ( $f === '' ) return null;
+  $d = DateTime::createFromFormat( '!Y-m-d', $f ) ?: DateTime::createFromFormat( '!d-m-Y', $f );
+  if ( !$d ) tf_responder( false, "Fecha de vencimiento inválida: $f" );
+  return $d->format( 'Ymd' );
 }
 
 /* ========================================================================== */
@@ -428,12 +438,13 @@ try {
       $toma = tf_toma();
       $incluir = ( $_POST[ 'incluir_no_contados' ] ?? 'false' ) === 'true';
       $plan = tf_plan( $conn, $db_dms, $bodega, $toma, $incluir );
-      // solo los que tienen movimiento
-      $plan[ 'productos' ] = array_values( array_filter( $plan[ 'productos' ], function ( $p ) {
-        foreach ( $p[ 'lotes' ] as $l )
-          if ( $l[ 'diferencia' ] != 0 ) return true;
-        return false;
-      } ) );
+      // solo lo que tiene cantidad por ajustar: lotes con diferencia y productos con al menos un lote a ajustar
+      $productos = [];
+      foreach ( $plan[ 'productos' ] as $p ) {
+        $p[ 'lotes' ] = array_values( array_filter( $p[ 'lotes' ], fn( $l ) => $l[ 'diferencia' ] != 0 ) );
+        if ( count( $p[ 'lotes' ] ) > 0 ) $productos[] = $p;
+      }
+      $plan[ 'productos' ] = $productos;
       tf_responder( true, '', $plan );
 
     case "ajustar":
@@ -520,6 +531,57 @@ try {
         'tipo_salida' => $tipoSalida, 'numero_salida' => $numSalida, 'lineas_salida' => count( $salidas ),
         'sin_lotes' => $plan[ 'sin_lotes' ],
       ] );
+
+    /* Crea un lote (maestro_lotes) y lo asocia a la toma (referencias_fis_lote) para las referencias
+       marcadas que no tienen lotes, para que el ajuste pueda hacerse sobre ese lote. */
+    case "crear_lotes":
+      $bodega = tf_bodega();
+      $codigos = json_decode( ( string )( $_POST[ 'codigos' ] ?? '[]' ), true );
+      $lote = strtoupper( trim( ( string )( $_POST[ 'lote' ] ?? '' ) ) );
+      $vcmto = tf_fecha_sql( ( string )( $_POST[ 'vcmto' ] ?? '' ) );
+      if ( !is_array( $codigos ) || count( $codigos ) === 0 ) tf_responder( false, 'No hay referencias para crear lote' );
+      if ( count( $codigos ) > 1000 ) tf_responder( false, 'Máximo 1000 referencias por vez' );
+      if ( $lote === '' ) tf_responder( false, 'Digite el nombre del lote' );
+      if ( mb_strlen( $lote ) > 30 ) tf_responder( false, 'El lote no puede tener más de 30 caracteres' );
+      $codigos = array_values( array_unique( array_filter( array_map( fn( $c ) => trim( ( string )$c ), $codigos ), fn( $c ) => $c !== '' ) ) );
+      $notasLote = mb_substr( "Creado en toma fisica web bodega $bodega por $usuario", 0, 250 );
+
+      $creados = [];
+      $omitidos = [];
+      if ( !sqlsrv_begin_transaction( $conn ) ) throw new Exception( tf_error_sql() );
+      try {
+        foreach ( $codigos as $cod ) {
+          $f = tf_rows( $conn, "select codigo from $db_dms.dbo.referencias_fis where codigo = ? and bodega = ? and fisico = 1", [ $cod, $bodega ] );
+          if ( count( $f ) === 0 ) { $omitidos[] = [ 'codigo' => $cod, 'motivo' => 'No está marcada para toma física' ]; continue; }
+          $tiene = tf_rows( $conn, "select top 1 1 as x from $db_dms.dbo.referencias_fis_lote where codigo = ? and bodega = ?", [ $cod, $bodega ] );
+          if ( count( $tiene ) > 0 ) { $omitidos[] = [ 'codigo' => $cod, 'motivo' => 'Ya tiene lotes en la toma' ]; continue; }
+
+          // si el lote ya existe en maestro_lotes para ese código se reutiliza (codigo + lote es único)
+          $m = tf_rows( $conn, "select id_lote from $db_dms.dbo.maestro_lotes where codigo = ? and lote = ?", [ $cod, $lote ] );
+          if ( count( $m ) > 0 ) {
+            $idLote = ( int )$m[ 0 ][ 'id_lote' ];
+          } else {
+            // OUTPUT ... INTO por si la tabla tiene triggers
+            $m = tf_rows( $conn, "set nocount on;
+                                  declare @t table (id_lote int);
+                                  insert into $db_dms.dbo.maestro_lotes (codigo, lote, lote_vcmto, notas)
+                                  output inserted.id_lote into @t
+                                  values (?, ?, ?, ?);
+                                  select id_lote from @t;", [ $cod, $lote, $vcmto, $notasLote ] );
+            $idLote = ( int )( $m[ 0 ][ 'id_lote' ] ?? 0 );
+            if ( $idLote <= 0 ) throw new Exception( "No se pudo crear el lote de $cod" );
+          }
+
+          tf_exec( $conn, "insert into $db_dms.dbo.referencias_fis_lote (codigo, bodega, id_lote, lote_vcmto) values (?, ?, ?, ?)",
+            [ $cod, $bodega, $idLote, $vcmto ] );
+          $creados[] = [ 'codigo' => $cod, 'id_lote' => $idLote ];
+        }
+        if ( !sqlsrv_commit( $conn ) ) throw new Exception( tf_error_sql() );
+      } catch ( Throwable $e ) {
+        sqlsrv_rollback( $conn );
+        throw $e;
+      }
+      tf_responder( true, count( $creados ) . ' lote(s) creado(s)', [ 'lote' => $lote, 'creados' => $creados, 'omitidos' => $omitidos ] );
 
     case "historial":
       $bodega = tf_bodega();

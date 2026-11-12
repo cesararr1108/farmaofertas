@@ -6,6 +6,9 @@ let resultadosBusqueda = [];
 let ultimosConteos = [];
 let timerBusqueda = null;
 let previewOk = false;
+let idxResaltado = -1;      // fila resaltada en los resultados (Enter la selecciona)
+let filtroPintado = '';     // filtro con el que se pintaron los resultados
+let guardando = false;
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -65,18 +68,27 @@ $(function () {
     cargarHistorial();
   });
 
-  /* Búsqueda: Enter busca de inmediato (lector de código de barras), al escribir espera 400 ms */
+  /* Búsqueda: Enter (o ✓/Ir del teclado del celular) busca de inmediato; si ya hay resultados
+     en pantalla, Enter selecciona el resaltado (flechas para moverse). Al escribir espera 400 ms. */
+  $('#form-busqueda').on('submit', function (e) {
+    e.preventDefault();
+    clearTimeout(timerBusqueda);
+    const filtro = $('#busqueda').val().trim();
+    if (filtro && filtro === filtroPintado && resultadosBusqueda[idxResaltado]) {
+      seleccionar(resultadosBusqueda[idxResaltado]);
+      return;
+    }
+    buscar(true);
+  });
   $('#busqueda').on('keydown', function (e) {
-    if (e.key === 'Enter') {
+    if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && resultadosBusqueda.length && filtroPintado) {
       e.preventDefault();
-      clearTimeout(timerBusqueda);
-      buscar(true);
-    } else if (e.key === 'ArrowDown' && resultadosBusqueda.length) {
-      e.preventDefault();
-      $('#resultados tbody tr').first().trigger('focus');
+      const n = resultadosBusqueda.length;
+      resaltar(e.key === 'ArrowDown' ? Math.min(idxResaltado + 1, n - 1) : Math.max(idxResaltado - 1, 0));
     }
   }).on('input', function () {
     clearTimeout(timerBusqueda);
+    filtroPintado = '';
     if ($(this).val().trim().length >= 3) timerBusqueda = setTimeout(() => buscar(false), 400);
   });
 
@@ -90,13 +102,30 @@ $(function () {
 
   $('#modo_sumar').on('change', actualizarLabelCantidad);
 
+  // Enter o ✓ del teclado guardan (el form evita depender del botón)
+  $('#form-cantidad').on('submit', function (e) { e.preventDefault(); guardarConteo(); });
   $('#cantidad').on('keydown', function (e) {
-    if (e.key === 'Enter') { e.preventDefault(); guardarConteo(); }
     if (e.key === 'Escape') { limpiarSeleccion(); $('#busqueda').trigger('focus'); }
   });
   $('#btn-guardar-conteo').on('click', guardarConteo);
   $('#btn-limpiar-conteo').on('click', limpiarConteo);
   $('#btn-ver-lotes').on('click', () => productoActual && verLotes(productoActual.codigo));
+  $('#btn-crear-lote-producto').on('click', () => {
+    if (!productoActual) return;
+    const p = productoActual;
+    abrirCrearLote([{ codigo: p.codigo, descripcion: p.descripcion }], () => { p.n_lotes = 1; seleccionar(p); });
+  });
+  $('#form-crear-lote').on('submit', function (e) { e.preventDefault(); guardarCrearLote(); });
+  $('#listado').on('click', '.btn-crear-lote', function () {
+    const d = datosListado.find(x => String(x.codigo) === String($(this).data('codigo')));
+    if (d) abrirCrearLote([d], listar);
+  });
+  $('#resumen-listado').on('click', '#btn-crear-lotes-listado', function () {
+    abrirCrearLote(datosListado.filter(d => d.sin_lotes && d.conteo !== null), listar);
+  });
+  $('#resumen-ajuste').on('click', '#btn-crear-lotes-ajuste', function () {
+    abrirCrearLote(sinLotesPreview, previsualizar);
+  });
 
   $('#btn-listar, #btn-tab-listado').on('click', listar);
   $('#estado').on('change', listar);
@@ -127,14 +156,19 @@ function buscar(desdeEnter) {
       if (desdeEnter) $('#busqueda').trigger('select');
       return;
     }
+    // la respuesta ya no corresponde a lo que hay escrito
+    if ($('#busqueda').val().trim() !== filtro) return;
     // código o código de barras exacto: seleccionar directo
     const exactos = r.data.filter(p => p.exacto);
     if (desdeEnter && (exactos.length === 1 || r.data.length === 1)) {
       $('#resultados').empty();
+      filtroPintado = '';
       seleccionar(exactos[0] || r.data[0]);
       return;
     }
+    filtroPintado = filtro;
     pintarResultados();
+    resaltar(0);
   }).fail(m => alerta('error', 'Búsqueda', esc(m)));
 }
 
@@ -150,6 +184,12 @@ function pintarResultados() {
   $('#resultados').html(h + '</tbody></table>');
 }
 
+function resaltar(i) {
+  idxResaltado = i;
+  const fila = $('#resultados tbody tr').removeClass('activo').filter(`[data-idx="${i}"]`).addClass('activo');
+  if (fila.length) fila[0].scrollIntoView({ block: 'nearest' });
+}
+
 function seleccionar(p) {
   if (!p) return;
   productoActual = p;
@@ -158,6 +198,7 @@ function seleccionar(p) {
   $('#p_stock').text(fmt(p.stock));
   $('#p_conteo').html(p.conteo === null ? '<span class="text-muted">sin contar</span>' : fmt(p.conteo));
   $('#p_lotes').html(p.n_lotes > 0 ? p.n_lotes : '<span class="text-danger fw-bold">sin lotes en la toma (no se podrá ajustar)</span>');
+  $('#btn-crear-lote-producto').toggle(!(p.n_lotes > 0));
   $('#resultados tbody tr').removeClass('activo').filter(`[data-idx="${resultadosBusqueda.indexOf(p)}"]`).addClass('activo');
   actualizarLabelCantidad();
   $('#panel-producto').show();
@@ -175,11 +216,12 @@ function limpiarSeleccion() {
 }
 
 function guardarConteo() {
-  if (!productoActual) return;
+  if (!productoActual || guardando) return;
   const v = $('#cantidad').val();
   if (v === '' || isNaN(Number(v))) { toast('warning', 'Digite la cantidad'); $('#cantidad').trigger('focus'); return; }
   const modo = $('#modo_sumar').is(':checked') ? 'sumar' : 'reemplazar';
   const p = productoActual;
+  guardando = true;
   $('#btn-guardar-conteo').prop('disabled', true);
   api('guardar_conteo', { codigo: p.codigo, cantidad: v, modo }).then(r => {
     p.conteo = r.data.conteo;
@@ -190,9 +232,10 @@ function guardarConteo() {
     if (resultadosBusqueda.includes(p)) pintarResultados();
     limpiarSeleccion();
     invalidarPreview();
+    filtroPintado = '';
     $('#busqueda').val('').trigger('focus');
   }).fail(m => alerta('error', 'Conteo', esc(m)))
-    .always(() => $('#btn-guardar-conteo').prop('disabled', false));
+    .always(() => { guardando = false; $('#btn-guardar-conteo').prop('disabled', false); });
 }
 
 function limpiarConteo() {
@@ -258,7 +301,9 @@ function filtrarListado() {
   const f = $('#filtro_listado').val().trim().toUpperCase();
   const datos = f ? datosListado.filter(d => (d.codigo + ' ' + d.descripcion).toUpperCase().includes(f)) : datosListado;
   const contados = datos.filter(d => d.conteo !== null).length;
-  $('#resumen-listado').html(`Referencias: <b>${datos.length}</b> &nbsp; Contadas: <b>${contados}</b> &nbsp; Pendientes: <b>${datos.length - contados}</b>`);
+  const sinLoteContados = datosListado.filter(d => d.sin_lotes && d.conteo !== null).length;
+  $('#resumen-listado').html(`Referencias: <b>${datos.length}</b> &nbsp; Contadas: <b>${contados}</b> &nbsp; Pendientes: <b>${datos.length - contados}</b>` +
+    (sinLoteContados ? ` &nbsp; <button class="btn btn-sm btn-outline-success py-0" id="btn-crear-lotes-listado"><i class="fa-solid fa-plus"></i> Crear lote a ${sinLoteContados} contada(s) sin lote</button>` : ''));
   let h = `<table class="table table-sm table-bordered table-hover"><thead class="table-light sticky-top"><tr>
     <th>Código</th><th>Descripción</th><th class="text-end">Sistema</th><th class="text-end">Contado</th><th class="text-end">Dif.</th><th class="text-center">Lotes</th><th></th></tr></thead><tbody>`;
   datos.forEach(d => {
@@ -268,13 +313,17 @@ function filtrarListado() {
       <td class="text-center">${d.sin_lotes ? '<span class="badge bg-danger">sin lotes</span>' : d.n_lotes}</td>
       <td class="text-nowrap">
         <button class="btn btn-sm btn-outline-primary py-0 btn-contar" data-codigo="${esc(d.codigo)}" title="Contar"><i class="fa-solid fa-barcode"></i></button>
-        ${d.sin_lotes ? '' : `<button class="btn btn-sm btn-outline-secondary py-0 btn-lotes" data-codigo="${esc(d.codigo)}" title="Lotes"><i class="fa-solid fa-boxes-stacked"></i></button>`}
+        ${d.sin_lotes
+          ? `<button class="btn btn-sm btn-outline-success py-0 btn-crear-lote" data-codigo="${esc(d.codigo)}" title="Crear lote"><i class="fa-solid fa-plus"></i></button>`
+          : `<button class="btn btn-sm btn-outline-secondary py-0 btn-lotes" data-codigo="${esc(d.codigo)}" title="Lotes"><i class="fa-solid fa-boxes-stacked"></i></button>`}
       </td></tr>`;
   });
   $('#listado').html(h + '</tbody></table>');
 }
 
 /* --------------------------------- Ajuste --------------------------------- */
+
+let sinLotesPreview = [];
 
 function invalidarPreview() {
   previewOk = false;
@@ -289,8 +338,10 @@ function previsualizar() {
     let res = `<div class="alert alert-info p-2 mb-2">
       Entradas: <b>${pl.lineas_entrada}</b> líneas / <b>${fmt(pl.unidades_entrada)}</b> und (costo $${fmt(Math.round(pl.costo_entrada))}) &nbsp;|&nbsp;
       Salidas: <b>${pl.lineas_salida}</b> líneas / <b>${fmt(pl.unidades_salida)}</b> und (costo $${fmt(Math.round(pl.costo_salida))})</div>`;
+    sinLotesPreview = pl.sin_lotes;
     if (pl.sin_lotes.length) {
-      res += `<div class="alert alert-warning p-2 mb-2"><b>${pl.sin_lotes.length}</b> referencia(s) contadas sin lotes en referencias_fis_lote; no se ajustarán:<br>` +
+      res += `<div class="alert alert-warning p-2 mb-2"><b>${pl.sin_lotes.length}</b> referencia(s) contadas sin lotes en la toma; no se ajustarán hasta crearles un lote
+        <button class="btn btn-sm btn-success py-0 ms-2" id="btn-crear-lotes-ajuste"><i class="fa-solid fa-plus"></i> Crear lote</button><br>` +
         pl.sin_lotes.map(p => `${esc(p.codigo)} - ${esc(p.descripcion)} (contado ${fmt(p.contado)})`).join('<br>') + '</div>';
     }
     $('#resumen-ajuste').html(res);
@@ -359,4 +410,46 @@ function cargarHistorial() {
     });
     $('#historial').html(h + '</tbody></table>');
   }).fail(m => $('#historial').html(`<div class="text-danger small">${esc(m)}</div>`));
+}
+
+/* ------------------------------- Crear lote ------------------------------- */
+
+let crearLoteItems = [];
+let crearLoteDespues = null;
+
+function hoyMas(anios) {
+  const d = new Date();
+  d.setFullYear(d.getFullYear() + anios);
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+
+function abrirCrearLote(items, despues) {
+  if (!items || !items.length) { toast('info', 'No hay referencias sin lote'); return; }
+  crearLoteItems = items;
+  crearLoteDespues = despues || null;
+  if (!$('#cl_lote').val()) $('#cl_lote').val('TF' + hoyMas(0).replace(/-/g, ''));
+  if (!$('#cl_vcmto').val()) $('#cl_vcmto').val(hoyMas(1));
+  $('#cl_cantidad').text(items.length);
+  $('#cl_lista').html(items.map(p => `${esc(p.codigo)} - ${esc(p.descripcion)}`).join('<br>'));
+  const modal = document.getElementById('modalCrearLote');
+  $(modal).one('shown.bs.modal', () => $('#cl_lote').trigger('focus').trigger('select'));
+  bootstrap.Modal.getOrCreateInstance(modal).show();
+}
+
+function guardarCrearLote() {
+  const lote = $('#cl_lote').val().trim().toUpperCase();
+  if (!lote) { toast('warning', 'Digite el lote'); return; }
+  $('#cl_guardar').prop('disabled', true);
+  api('crear_lotes', { codigos: JSON.stringify(crearLoteItems.map(p => p.codigo)), lote, vcmto: $('#cl_vcmto').val() })
+    .then(r => {
+      bootstrap.Modal.getOrCreateInstance(document.getElementById('modalCrearLote')).hide();
+      const d = r.data;
+      let msg = `Lote <b>${esc(d.lote)}</b> creado para <b>${d.creados.length}</b> referencia(s).`;
+      if (d.omitidos.length) msg += '<br><br>Omitidas:<br>' + d.omitidos.map(o => `${esc(o.codigo)}: ${esc(o.motivo)}`).join('<br>');
+      alerta(d.omitidos.length ? 'warning' : 'success', 'Crear lote', msg);
+      invalidarPreview();
+      if (crearLoteDespues) crearLoteDespues();
+    })
+    .fail(m => alerta('error', 'Crear lote', esc(m)))
+    .always(() => $('#cl_guardar').prop('disabled', false));
 }
